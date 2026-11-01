@@ -33,11 +33,18 @@ const {
 	rememberRecoverableLocalHubUrl: vi.fn((url: string) => url),
 	verifyHubConnection: vi.fn(),
 	// Idle by default, so existing replacement cases are unaffected.
-	queryHubSessionActivity: vi.fn(async () => ({
-		activeSessionCount: 0,
-		participantClientCount: 0,
-		activePluginRequests: 0,
-	})),
+	queryHubSessionActivity: vi.fn(
+		async (): Promise<{
+			activeSessionCount: number;
+			participantClientCount: number;
+			activePluginRequests: number;
+			activeCloudCommands?: number;
+		}> => ({
+			activeSessionCount: 0,
+			participantClientCount: 0,
+			activePluginRequests: 0,
+		}),
+	),
 	requestHubDrain: vi.fn(async () => true),
 	resolveProductionHubOwnerContext: vi.fn(() => ({
 		discoveryPath: "/tmp/hub-discovery.json",
@@ -554,6 +561,35 @@ describe("ensureDetachedHubServer", () => {
 		}
 	});
 
+	it("attaches to an older hub that is provisioning a cloud session instead of retiring it", async () => {
+		queryHubSessionActivity.mockResolvedValue({
+			activeSessionCount: 0,
+			participantClientCount: 0,
+			activePluginRequests: 0,
+			activeCloudCommands: 1,
+		});
+		readHubDiscovery.mockResolvedValueOnce({
+			url: "ws://127.0.0.1:25463/hub",
+			authToken: "busy-token",
+		});
+		probeHubServer.mockResolvedValueOnce({
+			url: "ws://127.0.0.1:25463/hub",
+			protocolVersion: "v1",
+			buildId: "old-build",
+			pid: 12345,
+		});
+		verifyHubConnection.mockResolvedValue(true);
+
+		const { ensureDetachedHubServer } = await import(".");
+
+		await expect(ensureDetachedHubServer("/workspace")).resolves.toEqual({
+			url: "ws://127.0.0.1:25463/hub",
+			authToken: "busy-token",
+		});
+		expect(requestHubShutdown).not.toHaveBeenCalled();
+		expect(spawn).not.toHaveBeenCalled();
+	});
+
 	it("reuses a healthy hub from a newer build without retiring it", async () => {
 		const kill = vi.spyOn(process, "kill").mockImplementation(() => true);
 		try {
@@ -1063,6 +1099,32 @@ describe("upgradeManagedHub", () => {
 		expect(spawn).not.toHaveBeenCalled();
 	});
 
+	it("leaves a hub provisioning a cloud session running when not forced", async () => {
+		queryHubSessionActivity.mockResolvedValue({
+			activeSessionCount: 0,
+			participantClientCount: 0,
+			activePluginRequests: 0,
+			activeCloudCommands: 1,
+		});
+		readHubDiscovery.mockResolvedValueOnce({
+			url: "ws://127.0.0.1:25463/hub",
+			authToken: "old-token",
+		});
+		probeHubServer.mockResolvedValueOnce({
+			url: "ws://127.0.0.1:25463/hub",
+			protocolVersion: "v1",
+			buildId: "old-build",
+			buildEpochMs: 500,
+		});
+
+		const { upgradeManagedHub } = await import(".");
+		const result = await upgradeManagedHub({ waitForIdleMs: 0 });
+
+		expect(result).toMatchObject({ outcome: "still_busy" });
+		expect(requestHubShutdown).not.toHaveBeenCalled();
+		expect(spawn).not.toHaveBeenCalled();
+	});
+
 	it("refuses to replace a hub running a newer build", async () => {
 		readHubDiscovery.mockResolvedValueOnce({
 			url: "ws://127.0.0.1:25463/hub",
@@ -1363,5 +1425,24 @@ describe("setHubDaemonLauncher", () => {
 		expect(__test__.resolveLaunchCommand("/work").launcher).toBe(
 			process.execPath,
 		);
+	});
+
+	it("applies child-only runtime settings while preserving daemon markers", async () => {
+		const { __test__, setHubDaemonLauncher } = await import(".");
+		const env = { ELECTRON_RUN_AS_NODE: "1", CLINE_RUN_AS_HUB_DAEMON: "0" };
+		setHubDaemonLauncher({
+			command: "/editor",
+			args: ["/extension/hub.js"],
+			env,
+		});
+		env.ELECTRON_RUN_AS_NODE = "0";
+		const command = __test__.resolveLaunchCommand("/work");
+		expect(command.args.slice(0, 2)).toEqual(["/extension/hub.js", "--cwd"]);
+		expect(command.env.ELECTRON_RUN_AS_NODE).toBe("1");
+		expect(command.env.CLINE_RUN_AS_HUB_DAEMON).toBe("1");
+		setHubDaemonLauncher(undefined);
+		expect(
+			__test__.resolveLaunchCommand("/work").env.ELECTRON_RUN_AS_NODE,
+		).toBe(process.env.ELECTRON_RUN_AS_NODE);
 	});
 });

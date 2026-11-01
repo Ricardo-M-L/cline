@@ -320,11 +320,13 @@ export {
 	authorizeMcpServerOAuth,
 	type CreateDisabledMcpToolPoliciesOptions,
 	type CreateDisabledMcpToolPolicyOptions,
+	type CreateMcpAppsRuntimeOptions,
 	type CreateMcpToolsOptions,
 	createDefaultMcpServerClientFactory,
 	createDisabledMcpToolPolicies,
 	createDisabledMcpToolPolicy,
 	createMcpAppsClientCapabilities,
+	createMcpAppsRuntime,
 	createMcpTools,
 	DEFAULT_MCP_CONNECT_TIMEOUT_MS,
 	type DefaultMcpServerClientFactoryOptions,
@@ -341,6 +343,10 @@ export {
 	loadMcpSettingsFile,
 	MCP_APP_MIME_TYPE,
 	MCP_APPS_EXTENSION_ID,
+	type McpAppResourceReadRequest,
+	type McpAppsRuntime,
+	type McpAppToolBinding,
+	type McpAppToolCallRequest,
 	type McpAppToolMeta,
 	type McpAppToolVisibility,
 	type McpConnectionStatus,
@@ -612,6 +618,7 @@ export {
 	isPluginDisabledGlobally,
 	isTelemetryOptedOutGlobally,
 	isToolDisabledGlobally,
+	readCloudModelIdGlobally,
 	readCompactionModeGlobally,
 	readCompactionStrategyGlobally,
 	readGlobalSettings,
@@ -623,6 +630,7 @@ export {
 	resolveDisabledToolNames,
 	resolveModelToolSettings,
 	setAutoUpdateEnabledGlobally,
+	setCloudModelIdGlobally,
 	setCompactionModeGlobally,
 	setCompactionStrategyGlobally,
 	setDisabledAgentPlugin,
@@ -976,6 +984,12 @@ export async function loadOpenTelemetryAdapter() {
 	return import("./services/telemetry/index.js");
 }
 export { Agent, createAgentRuntime } from "@cline/agents";
+export {
+	type ArtifactPublicationFile,
+	type ArtifactPublicationResult,
+	type ArtifactPublisher,
+	createPublishArtifactsTool,
+} from "./artifacts/publish";
 export type { ConnectorsRequest } from "./extensions/composio/composio-meta-tools";
 export { resolveComposioConnectionStatePath } from "./extensions/composio/composio-tools-extension";
 export {
@@ -1060,6 +1074,7 @@ export {
 export {
 	clearLiveModelsCatalogCache,
 	clearPrivateModelsCatalogCache,
+	clearPublicModelsCatalogCache,
 	DEFAULT_MODELS_CATALOG_URL,
 	getLiveModelsCatalog,
 	getProviderConfig,

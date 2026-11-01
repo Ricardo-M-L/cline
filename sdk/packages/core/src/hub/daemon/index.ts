@@ -301,7 +301,8 @@ export async function hubHasLiveSessions(
 		);
 		return (
 			activity.activeSessionCount > 0 ||
-			(activity.activePluginRequests ?? 0) > 0
+			(activity.activePluginRequests ?? 0) > 0 ||
+			(activity.activeCloudCommands ?? 0) > 0
 		);
 	} catch {
 		return false;
@@ -422,6 +423,8 @@ export interface HubDaemonLauncher {
 	command: string;
 	/** Arguments before the daemon's `--cwd`/endpoint arguments. Defaults to the daemon marker flag. */
 	args?: string[];
+	/** Child-only runtime settings, for example Electron's Node mode. */
+	env?: NodeJS.ProcessEnv;
 }
 
 let configuredHubDaemonLauncher: HubDaemonLauncher | undefined;
@@ -430,7 +433,11 @@ let configuredHubDaemonLauncher: HubDaemonLauncher | undefined;
 export function setHubDaemonLauncher(launcher?: HubDaemonLauncher): void {
 	const command = launcher?.command.trim();
 	configuredHubDaemonLauncher = command
-		? { command, args: launcher?.args ? [...launcher.args] : undefined }
+		? {
+				command,
+				args: launcher?.args ? [...launcher.args] : undefined,
+				env: launcher?.env ? { ...launcher.env } : undefined,
+			}
 		: undefined;
 }
 
@@ -475,7 +482,10 @@ function resolveLaunchCommand(
 			// running `cline-cli hub ensure`) keeps its own identity; otherwise
 			// this process's client identity (cline-cli, cline-acp, ...) is used.
 			...withHubLauncherIdentity(
-				withResolvedClineBuildEnv(process.env),
+				withResolvedClineBuildEnv({
+					...process.env,
+					...configuredHubDaemonLauncher?.env,
+				}),
 				resolveSelfLauncherIdentity(),
 			),
 			CLINE_NO_INTERACTIVE: "1",
@@ -968,7 +978,7 @@ export async function upgradeManagedHub(
 	// Only an observed-zero reading ends the window before the deadline.
 	// (Checks at least once so waitForIdleMs: 0 still observes an idle hub.)
 	let observedSessionCount: number | undefined;
-	let observedPluginRequests: number | undefined;
+	let observedBackgroundRequests: number | undefined;
 	for (;;) {
 		try {
 			const activity = await queryHubSessionActivity(
@@ -976,8 +986,10 @@ export async function upgradeManagedHub(
 				record.authToken,
 			);
 			observedSessionCount = activity.activeSessionCount;
-			observedPluginRequests = activity.activePluginRequests ?? 0;
-			if (observedSessionCount === 0 && observedPluginRequests === 0) {
+			observedBackgroundRequests =
+				(activity.activePluginRequests ?? 0) +
+				(activity.activeCloudCommands ?? 0);
+			if (observedSessionCount === 0 && observedBackgroundRequests === 0) {
 				break;
 			}
 		} catch {
@@ -991,7 +1003,7 @@ export async function upgradeManagedHub(
 		);
 	}
 	const confirmedIdle =
-		observedSessionCount === 0 && observedPluginRequests === 0;
+		observedSessionCount === 0 && observedBackgroundRequests === 0;
 	// Without force, only a positively idle hub may be replaced: a busy or
 	// unanswerable hub is handed back un-drained. With force, the user has
 	// already consented to interrupting the sessions the prompt showed them,

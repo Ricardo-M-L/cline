@@ -92,6 +92,14 @@ host presentation.
 
 `createForkSessionMetadata` from `@cline/core` copies metadata, replaces fork ancestry, and removes inherited handoff markers. Callers supply the source ID, timestamp, source, and optional `beforeRunCount`; titles and session creation remain caller-owned.
 
+## Starting a runtime from saved Hub history
+
+`session.resume` starts a runtime for a saved `sessionConfig.sessionId`. It accepts the execution configuration used by `session.create`, but reads conversation history on the Hub instead of requiring `initialMessages`. It prefers the live conversation when available and otherwise reads persisted history. Startup, replies, and session events use the existing `session.create` path.
+
+A missing ID returns `invalid_resume`, a missing session returns `session_not_found`, and empty history returns `session_messages_not_found`. These errors do not start a runtime. `session.create` remains unchanged, including empty context when `initialMessages` is omitted.
+
+Only `unsupported_command` permits falling back to `session.messages` followed by `session.create` with explicit history.
+
 ## Cloud sessions (experimental)
 
 `summarizeConversation({ messages, config, signal? })` from `@cline/core` returns
@@ -109,6 +117,36 @@ session lifecycle, transcript reconciliation, and approvals. Hosts provide API
 URLs and a fresh-token callback; feature gating and account selection stay in the
 host. Importing this subpath does not start a local agent.
 
+`createPublishArtifactsTool({ publish })` from `@cline/core` creates the opt-in
+`publish_artifacts` tool. It validates batches and local file paths, assigns missing
+IDs, and returns ordered per-file IDs or errors. The injected `ArtifactPublisher`
+receives prepared files (`path`, `artifactId`, `size`, `modifiedAt`) and an abort
+signal, and returns one result per file in input order. Storage-specific policy
+and persistence belong to the publisher; constructing the tool does not register
+it in default local tools. Hosts control tool approval and which local paths may
+be published; the tool itself does not restrict paths to a workspace.
+
+For cloud sessions, inject `createArtifactPublisher({ request, cloudSessionId })`
+from `@cline/core/cloud`. The host provides authenticated transport and the owning
+session ID. The publisher uploads directly with one signed policy per batch,
+refreshes expired policies, and retries transient failures with the same IDs.
+The service remains responsible for upload authorization and limits.
+
+`createArtifactFetcher({ request, cloudSessionId })` from `@cline/core/cloud`
+returns `fetchArtifact({ artifactId, signal? })`, which downloads a streaming
+`Response`. Each fetcher caches up to 128 signed URLs, refreshing 30 seconds before
+expiry or once after a storage HTTP 403. Missing files and file bytes are not cached.
+Reuse one fetcher per authenticated account/session; discard it on sign-out or
+account changes. Cache hits do not recheck session permissions until URL renewal.
+Wait for a successful publication result before fetching a new artifact. The caller
+consumes or cancels the response body and applies any read size limit. The optional
+signal cancels the download, including while reading its body. This helper does not
+register an agent tool or attach files to messages.
+
+`HubCloudSessionClient.getArtifactDownloadUrl(sessionId, artifactId)` resolves
+an existing artifact through the authenticated Hub without starting its sandbox.
+It returns a signed HTTPS URL and expiry for clients that download directly.
+
 For ordinary creation, `CloudCreationUnconfirmedError` means a dispatched request
 could not be reconciled. It remains a `CloudSessionError` with code `request_failed`;
 hosts should direct users to their session list instead of offering a blind retry.
@@ -121,6 +159,23 @@ The optional sixth argument to `send` accepts a `beforeDispatch` callback.
 The callback runs before submission and can throw to prevent it. A successful
 return without `recoveredAfterDisconnect` confirms acknowledgement.
 The callback does not confirm acceptance.
+`create({ ...input, initialMessage: { text, images } })` creates the task and sends
+the first message, returning the session attachment and `initialSend`. Without
+`initialMessage`, creation does not send; `initialPrompt` is metadata only.
+Retry a failed initial send on the created target only when `dispatched` is `false`.
+The Hub continues after viewer disconnects. A lost reply raises `request_failed`;
+check cloud tasks before retrying.
+Hub clients can publish an approved snapshot before creation with `localGit`.
+Pass the `organizationId` returned by `prepareHandoffRepository`, or `null` for Personal.
+Omit the preview-only `sourceBranch`, `files`, and `commits` fields from the plan.
+This requires token-authenticated workspace access.
+Attachments must be image data URLs within the shared media-size limits.
+New checkpoint commits are unsigned and skip commit hooks, including pre-commit secret scans.
+Pre-push hooks run in the live source checkout and can modify it.
+Git supplies the captured commit SHA to those hooks on stdin.
+The sensitive-path checks inspect filenames, not file contents.
+Publication creates no local branch or tracking configuration.
+Remote branches remain if verification or cloud creation fails.
 Viewers hydrating active runs with `readMessages` reconcile canonical history at
 completion even when they missed the run-start event and earlier content deltas.
 
@@ -134,6 +189,69 @@ through `restoreCreationOptions`, until the inner task is found or created (or
 the outer session is deleted). `dispose` preserves an injected map; without one,
 the controller owns and clears its pending state. Restoring options alone never
 authorizes recreation of a missing established task.
+
+### Hub-owned cloud viewers
+
+`HubCloudSessionClient` from `@cline/core/cloud` uses an authenticated,
+registered `NodeHubClient` from `@cline/core/hub`. Reuse the host's existing
+Hub connection, or create and connect a `NodeHubClient` with the Hub URL,
+auth token, client ID, and workspace root. The cloud client accepts an async
+connection factory and connects lazily; `connect()` explicitly hydrates it.
+
+```ts
+import { HubCloudSessionClient } from "@cline/core/cloud";
+import type { NodeHubClient } from "@cline/core/hub";
+
+async function openCloudSession(hub: NodeHubClient, sessionId: string) {
+  const viewer = new HubCloudSessionClient(async () => {
+    await hub.connect();
+    return hub;
+  });
+  const unsubscribe = viewer.subscribe((event) => console.log(event));
+  try {
+    await viewer.attach(sessionId);
+    return await viewer.readMessages(sessionId);
+  } finally {
+    unsubscribe();
+    await viewer.dispose();
+  }
+}
+```
+
+The Hub owns the account-scoped controller, credentials, organization lookup,
+provisioning, and sandbox connections. Disposing a viewer releases its subscription
+and projected state; admitted cloud work and sandbox connections continue. The
+host retains ownership of its shared `NodeHubClient`. Account changes retire the
+old controller; Hub shutdown disposes it. Direct controller hosts instead own
+and dispose their controller and its connections.
+
+The viewer supports the serializable operations in `CLOUD_HUB_OPERATIONS`,
+with arguments/results described by `CloudHubArgs` and `CloudHubResult`.
+`CloudHubScope` binds commands to the observed Hub instance and account generation;
+callers use the viewer methods rather than constructing RPC envelopes. Snapshot
+recovery includes empty sets, removes deleted sessions, and rejects stale revisions.
+Dispatched actions are not automatically resent after an uncertain reply.
+Handoff callbacks and the sixth `send` lifecycle argument are direct-controller
+features and cannot cross this RPC boundary. Hub-backed creation defaults to
+`"resumable"` sandboxes.
+
+Hosts with a separate signed-in account can include `expectedAccountId` in the
+scope passed to `prepareHandoffRepository`, `listModels`, and `create`. The Hub
+rejects a mismatch with its persisted account before running the operation.
+
+Discovery caches, pending listing requests, and newly created fallback rows are
+scoped to their organization; switching the sidebar preserves other organizations’
+task state without displaying their rows. Discovery’s `timeoutMs` covers both
+organization resolution and listing. If the organization is still unknown at
+the deadline, discovery returns no cloud rows; cached rows are used only after
+establishing their matching organization.
+
+After a successful organization switch, `refreshOrganization()` invalidates the
+Hub's cached organization before fetching the current one. A fetch failure leaves
+the old cache invalidated. Account-switch success and desktop cleanup must not
+depend on this optional refresh; cloud-disabled hosts skip it. A new viewer's
+watch also invalidates the cache, covering switches made while the Hub was
+unreachable without interrupting existing cloud work.
 
 ## Experimental cloud handoff
 
@@ -241,6 +359,9 @@ only manages SSH and forwards the authenticated hub connection.
 Clients whose own process cannot host the Hub daemon can call
 `setHubDaemonLauncher({ command: "/path/to/cline" })` so detached Hubs they
 start are launched through the Cline CLI.
+The launcher also accepts `args` and child-only `env` overrides. For an Electron
+executable, pass `ELECTRON_RUN_AS_NODE: "1"` in `env`. Required Hub daemon markers
+take precedence over these overrides.
 
 The hub `/health` endpoint includes `hubId`, the instance identity also returned by authenticated `/status` and discovery. Restart callers can compare it before and after shutdown to distinguish a replacement at the same address from the original hub.
 
@@ -422,6 +543,12 @@ standalone adapters do this in the `errorCode` dimension, and use the bounded
 labels `signal` and `no_exit_code` for `CommandTerminationError`. Only an actual
 numeric exit is reported as `exitCode`.
 
+## Tool success context
+
+`AgentTool` and `createTool` accept optional `successContext` text. The agent runtime appends it after the iteration’s tool results, once after-tool hooks have run, without changing the tool output. It reaches the model as a user-role context message with `displayRole: "system"`, hidden from client transcripts. Errors, skipped calls, and hooks that stop execution do not add it. It is retained as conversation history and remains subject to context compaction.
+
+`createAskQuestionTool` and the question tool from `createDefaultTools` use this field to remind the model to continue after an answer, in both direct `Agent` and `ClineCore` sessions.
+
 ## Symlinked instruction files
 
 Rules and workflows can be symbolic links to regular files. Source paths and
@@ -472,6 +599,38 @@ tool calls on an already connected server. A read that starts while the server
 is being disconnected or re-registered can fail with a disconnect error; retry
 it.
 
+For sessions, set `mcpApps: true` in the session config (`CoreRuntimeFeatures`).
+The runtime builder then advertises the extension to every settings and Agent
+Plugin MCP server it connects, and the session gains an MCP Apps runtime that
+uses those same connections. Hosts reach it through `ClineCore`:
+
+- `resolveMcpAppTool(sessionId, toolName)` maps an agent tool name (as it
+  appears in tool events, for example `weather__show_weather`) to
+  `{ serverName, toolName, resourceUri }`. It returns `undefined` for tools with
+  no `ui://` resource, for sessions without MCP Apps, and for runtimes or hub
+  daemons that do not support MCP Apps.
+- `readMcpAppResource(sessionId, { serverName, uri })` reads a `ui://` resource
+  from one of the session's MCP servers. Other URI schemes are rejected.
+- `callMcpAppTool(sessionId, { serverName, toolName, arguments })` calls a tool
+  on the app's behalf. It rejects tools whose visibility lacks `"app"`, tools
+  the server does not list, servers outside the session, and tools the session
+  disables through `toolPolicies` or the global `disabledTools` setting (matched
+  by agent tool name, such as `weather__refresh_view`). App calls are recorded
+  as tool usage telemetry, but do not request tool approval and do not run tool
+  hooks; a host that wants consent must ask before calling.
+
+Reads and calls reach every enabled settings and Agent Plugin server, including
+ones that failed to list tools at startup; the manager reconnects on demand.
+`resolveMcpAppTool` only searches servers that loaded tools at startup, since
+the agent can only call tools from those. Neither method checks which server an
+app came from, so a host bridging app requests must pass the `serverName` from
+the app's `resolveMcpAppTool` binding rather than one the app supplies.
+
+`readMcpAppResource` and `callMcpAppTool` throw when the session was started
+without `mcpApps` or has no MCP servers. Hub-backed hosts send these as the
+`session.mcp_apps.*` commands, so the hub daemon serves them from the session's
+own MCP manager.
+
 ## Run stall telemetry
 
 `@cline/core` measures stalls with a `RunHealthObserver`
@@ -496,3 +655,15 @@ run returns.
 No message text leaves the client: `textSignature` and `session.input_sent`'s
 `bumpKind` are enums computed locally
 (`packages/core/src/services/telemetry/stall-signals.ts`).
+
+### UX verification report renderer
+
+`@cline/shared/browser` exports `UxVerificationReportSchema`, `UxVerificationCheckSchema`, `UxScreenshotSchema` and their types. A report contains a title, environment subtitle and ordered checks with unique IDs, passed/failed/blocked statuses, observations and optional action labels. Passed/failed checks require screenshot evidence. This contract describes presentation independently of how checks are run.
+
+`@cline/ui` exports `AgentUxVerification` with `output` and `state` (`running`, `completed`, `error`). It validates the report and renders screenshot evidence, derived status counts, titles, observations, thumbnails and optional slideshow. Left/Right switch slides and pause playback; Space toggles playback while the carousel itself has focus. Import `@cline/ui/components.css` for styling.
+
+Native inline screenshots use validated browser-owned Blob URLs and show a fallback on load errors. Hosts supply `renderScreenshot(check, className, presentation)` for trusted remote or authenticated asset references, including retrying signed URLs only after a fetch error; the renderer performs no URL refresh or transport. Hosts supply `onExpandScreenshot(check)` to open their own image viewer. No producer tool, subagent lifecycle, storage format, CLI projection or product transcript policy is part of this component.
+
+UX verification screenshots reuse canonical `GeneratedMedia` with `modality: "image"` and the supported raster media types. `source` supports inline `base64`, trusted host-resolved `url`, or stable `artifact` references. The screenshot's `id`, optional `name`, and `sizeBytes` are preserved. Hosts can pass screenshots directly to an existing generated-media/artifact renderer; there are no separate top-level `data` or `url` screenshot fields. Signed access URLs remain transient host state when using artifact references.
+
+UX screenshot renderers receive `presentation: "slide" | "thumbnail"`. Thumbnail rendering must be non-interactive, so hosts should keep retry controls in the main image and expanded view only. The shared generated-media renderer handles native image load failures, so expanded inline evidence also shows an unavailable state.
