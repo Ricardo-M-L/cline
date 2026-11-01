@@ -53,6 +53,49 @@ describe("readRepoStatus", () => {
 		});
 	});
 
+	it.each([
+		"sha1",
+		"sha256",
+	])("includes staged files before the first commit in a %s repository", async (objectFormat) => {
+		const directory = mkdtempSync(join(tmpdir(), "cline-unborn-status-"));
+		repositories.push(directory);
+		execFileSync("git", [
+			"init",
+			"-q",
+			"-b",
+			"main",
+			`--object-format=${objectFormat}`,
+			directory,
+		]);
+		expect((await readRepoStatus(directory)).diffStats).toBeNull();
+		writeFileSync(join(directory, "tracked.txt"), "original\n");
+		execFileSync("git", ["-C", directory, "add", "tracked.txt"]);
+		expect((await readRepoStatus(directory)).diffStats).toEqual({
+			files: 1,
+			additions: 1,
+			deletions: 0,
+		});
+		writeFileSync(join(directory, "tracked.txt"), "updated\n");
+		writeFileSync(join(directory, "untracked.txt"), "not in the index\n");
+
+		expect((await readRepoStatus(directory)).diffStats).toEqual({
+			files: 1,
+			additions: 1,
+			deletions: 0,
+		});
+	});
+
+	it("keeps null stats outside a Git repository", async () => {
+		const directory = mkdtempSync(join(tmpdir(), "cline-no-repository-"));
+		repositories.push(directory);
+		writeFileSync(join(directory, "untracked.txt"), "not tracked\n");
+
+		expect(await readRepoStatus(directory)).toEqual({
+			branch: null,
+			diffStats: null,
+		});
+	});
+
 	it("includes staged new files and unstaged edits together", async () => {
 		const directory = repositoryWithCommit();
 		writeFileSync(join(directory, "staged.txt"), "new file\n");
